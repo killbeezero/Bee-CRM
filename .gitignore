@@ -1,0 +1,9 @@
+*.json
+token.json
+credentials.json
+venv/
+build/
+dist/
+__pycache__/
+*.spec
+.DS_Store

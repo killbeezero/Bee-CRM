@@ -1,0 +1,115 @@
+import sys
+import os.path
+from PyQt6.QtWidgets import QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QLabel, QLineEdit, QHeaderView
+from PyQt6.QtCore import Qt
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SPREADSHEET_ID = "1L5J_fIdRZidQpXIMBCRLYIzvyCp_1aTngROBE6M0DFc"
+RANGE_NAME = "A2:G200"
+
+class CRMDesktopApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("CRM 桌面專業版 🦞")
+        self.resize(1100, 700)
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self.init_customer_tab()
+        self.init_sender_tab()
+        self.load_data_from_gsheets()
+
+    def init_customer_tab(self):
+        self.customer_tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # 建立搜尋欄
+        search_layout = QHBoxLayout()
+        search_label = QLabel("🔍 快速搜尋:")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholder_text("輸入公司名稱或是收件人...")
+        self.search_input.textChanged.connect(self.filter_table)
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input)
+        
+        self.status_label = QLabel("雲端狀態: 準備連線...", self)
+        
+        # 建立表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["ID", "公司名稱", "收件人", "地址", "郵遞區號", "電話", "統編"])
+        
+        # 表格樣式調整
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        
+        # 隱藏 ID 欄位 (第一欄)
+        self.table.hideColumn(0)
+
+        layout.addLayout(search_layout)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.table)
+        self.customer_tab.setLayout(layout)
+        self.tabs.addTab(self.customer_tab, "客戶管理")
+
+    def init_sender_tab(self):
+        self.sender_tab = QWidget()
+        self.tabs.addTab(self.sender_tab, "寄件人設定")
+
+    def load_data_from_gsheets(self):
+        creds = None
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                creds = flow.run_local_server(port=0)
+            with open("token.json", "w") as token:
+                token.write(creds.to_json())
+
+        try:
+            service = build("sheets", "v4", credentials=creds)
+            sheet = service.spreadsheets()
+            result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()
+            self.raw_values = result.get("values", [])
+
+            if not self.raw_values:
+                self.status_label.setText("雲端狀態: 找不到資料。")
+            else:
+                self.update_table(self.raw_values)
+                self.status_label.setText(f"雲端狀態: 成功同步 {len(self.raw_values)} 筆資料 ✅")
+
+        except HttpError as err:
+            self.status_label.setText(f"雲端狀態: 連線錯誤 ❌ {err}")
+
+    def update_table(self, data):
+        self.table.setRowCount(len(data))
+        for row_idx, row_data in enumerate(data):
+            for col_idx, cell_data in enumerate(row_data):
+                self.table.setItem(row_idx, col_idx, QTableWidgetItem(str(cell_data)))
+
+    def filter_table(self, text):
+        text = text.lower()
+        for i in range(self.table.rowCount()):
+            match = False
+            # 搜尋公司名稱(索引1)和收件人(索引2)
+            for j in [1, 2]:
+                item = self.table.item(i, j)
+                if item and text in item.text().lower():
+                    match = True
+                    break
+            self.table.setRowHidden(i, not match)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = CRMDesktopApp()
+    window.show()
+    sys.exit(app.exec())
