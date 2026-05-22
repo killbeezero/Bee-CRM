@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+import sys
 
 a = Analysis(
     ['main.py'],
@@ -45,13 +45,15 @@ exe = EXE(
     entitlements_file=None,
 )
 
-app = BUNDLE(
-    exe,
-    name='蜜蜂CRM.app',
-    icon=None,
-    bundle_identifier='com.beecrm.app',
-    info_plist={
-        'NSHighResolutionCapable': True,
-        'CFBundleDisplayName': '蜜蜂CRM',
-    },
-)
+# macOS 專用：包成 .app bundle
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        exe,
+        name='蜜蜂CRM.app',
+        icon=None,
+        bundle_identifier='com.beecrm.app',
+        info_plist={
+            'NSHighResolutionCapable': True,
+            'CFBundleDisplayName': '蜜蜂CRM',
+        },
+    )

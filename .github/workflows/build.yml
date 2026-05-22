@@ -1,0 +1,72 @@
+name: Build Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 允許建立 Release 並上傳檔案
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macOS
+          - os: windows-latest
+            platform: Windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install PyQt6 reportlab google-auth google-auth-oauthlib \
+                      google-api-python-client playwright pyinstaller
+
+      - name: Write credentials.json from secret
+        shell: bash
+        env:
+          CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+        run: echo "$CREDENTIALS_JSON" > credentials.json
+
+      # ── macOS：輸出 .app → 壓縮成 zip ──────────────────────
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: pyinstaller 蜜蜂CRM.spec --clean -y
+
+      - name: Zip macOS app
+        if: runner.os == 'macOS'
+        run: cd dist && zip -r 蜜蜂CRM-macOS.zip 蜜蜂CRM.app
+
+      - name: Upload macOS to Release
+        if: runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/蜜蜂CRM-macOS.zip
+          generate_release_notes: true
+
+      # ── Windows：輸出單一 .exe ──────────────────────────────
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller 蜜蜂CRM.spec --clean -y
+
+      - name: Upload Windows to Release
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/蜜蜂CRM.exe
+          generate_release_notes: true
