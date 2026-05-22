@@ -111,6 +111,62 @@ def clean_phone(phone: str) -> str:
     return re.sub(r'[^0-9]', '', phone)
 
 
+_CAPTCHA_PROMPT = "這是網頁圖形驗證碼，格式為五位數字（0–9），不含任何英文字母。請只輸出這五位數字，不要有空格、標點或任何說明。"
+
+
+def solve_captcha_with_claude(captcha_path: str) -> str:
+    """使用本地 oMLX (gemma-4-e2b-it-4bit) 判讀驗證碼；失敗則以 Claude Haiku 補底。"""
+    import base64
+    with open(captcha_path, "rb") as f:
+        b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    # ── 主要：本地 LLM（oMLX）────────────────────────────────
+    try:
+        import httpx
+        resp = httpx.post(
+            "http://127.0.0.1:8000/v1/chat/completions",
+            headers={"Authorization": "Bearer killbee"},
+            json={
+                "model": "gemma-4-e2b-it-4bit",
+                "max_tokens": 32,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        {"type": "text", "text": _CAPTCHA_PROMPT},
+                    ],
+                }],
+            },
+            timeout=20,
+        )
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        if text:
+            return text
+    except Exception:
+        pass
+
+    # ── 備用：Claude Haiku API ────────────────────────────────
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=32,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                    {"type": "text", "text": _CAPTCHA_PROMPT},
+                ],
+            }],
+        )
+        return msg.content[0].text.strip()
+    except Exception:
+        return ""
+
+
 # ════════════════════════════════════════════════════════════
 #  i郵箱跨執行緒信號橋
 # ════════════════════════════════════════════════════════════
@@ -133,9 +189,11 @@ class IBoxWorker(threading.Thread):
          → Step2 填收件人 → Step3 填包裹 → 確認 → 取得 QR Code
     """
 
-    def __init__(self, credentials: dict, customer: dict, package_info: dict, signals: IBoxSignals):
+    def __init__(self, credentials: dict, sender: dict, customer: dict,
+                 package_info: dict, signals: IBoxSignals):
         super().__init__(daemon=True)
         self.credentials  = credentials   # {"username": ..., "password": ...}
+        self.sender       = sender        # CRM sender_info dict
         self.customer     = customer      # CRM customer_info dict
         self.package_info = package_info  # {"item_type": ..., "description": ..., "size": ...}
         self.signals      = signals
@@ -156,33 +214,35 @@ class IBoxWorker(threading.Thread):
 
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)
+                browser = p.chromium.launch(
+                    executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    headless=False,
+                )
                 context = browser.new_context()
                 page    = context.new_page()
                 page.set_default_timeout(30_000)
 
-                # ① 前往會員頁，判斷是否需要登入
-                self.signals.log.emit("正在連線 EZPost...")
-                page.goto("https://ezpost.post.gov.tw/SingleShip")
+                # ① 直接前往登入頁並填入帳密
+                self.signals.log.emit("正在連線 EZPost 登入頁...")
+                page.goto("https://ezpost.post.gov.tw/Account/Login")
                 page.wait_for_load_state("networkidle", timeout=20_000)
-
-                if "Login" in page.url or "login" in page.url:
-                    self._do_login(page)
+                self._do_login(page)
 
                 # ② 選擇「i郵箱自助寄件」→ 前往注意事項
                 self.signals.log.emit("選擇 i郵箱自助寄件...")
                 self._select_ibox_type(page)
 
-                # ③ 注意事項頁：捲底 → 同意
-                if "SingleShipRule" in page.url:
+                # ③ 注意事項頁：捲底 → 同意（判斷是否有 #termsContainer）
+                if page.locator("#termsContainer").count() > 0:
                     self._agree_terms(page)
 
-                # ④ Step 1：寄件人 → 帶入會員資料 → 下一步
+                # ④ Step 1：寄件人 → 帶入會員資料 → 填 CRM 寄件人 → 下一步
                 page.wait_for_url("**/Mail/IBoxMailEdit**", timeout=15_000)
-                self.signals.log.emit("Step 1：帶入會員寄件人資料...")
+                self.signals.log.emit("Step 1：填入寄件人資料...")
                 page.wait_for_selector("button:has-text('帶入會員資料')", timeout=10_000)
                 page.click("button:has-text('帶入會員資料')")
                 page.wait_for_timeout(800)
+                self._fill_sender(page)
                 page.click("button:has-text('下一步')")
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(500)
@@ -190,31 +250,28 @@ class IBoxWorker(threading.Thread):
                 # ⑤ Step 2：收件人
                 self.signals.log.emit("Step 2：填入收件人資料...")
                 self._fill_recipient(page)
-                page.click("button:has-text('下一步')")
+                page.wait_for_selector("#next-button-step", timeout=5_000)
+                page.click("#next-button-step")
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(500)
 
                 # ⑥ Step 3：內裝物品
                 self.signals.log.emit("Step 3：填入包裹資料...")
                 self._fill_package(page)
-                page.click("button:has-text('確認')")
+                page.wait_for_selector("#next-button-step", timeout=5_000)
+                page.click("#next-button-step")
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(500)
 
-                # ⑦ 確認寄件頁
-                if "MailInfoDetailsCheck" in page.url:
-                    self.signals.log.emit("確認寄件資訊...")
-                    page.wait_for_selector("button:has-text('確認寄件')", timeout=10_000)
-                    page.click("button:has-text('確認寄件')")
-                    page.wait_for_timeout(1_000)
-                    # 處理二次確認彈窗
-                    for btn_text in ["確認寄件", "確認"]:
-                        try:
-                            page.click(f"button:has-text('{btn_text}')", timeout=4_000)
-                            break
-                        except Exception:
-                            pass
-                    page.wait_for_load_state("networkidle")
+                # ⑦ 確認寄件（按鈕 #ConfirmSendMailInfo，URL 仍在 IBoxMailEdit）
+                self.signals.log.emit("確認寄件資訊...")
+                page.wait_for_load_state("networkidle", timeout=15_000)
+                page.wait_for_selector("#ConfirmSendMailInfo", timeout=30_000)
+                page.click("#ConfirmSendMailInfo")
+                page.wait_for_selector(".confirm-btn-alert", timeout=8_000)
+                page.click(".confirm-btn-alert")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(1_000)
 
                 # ⑧ 完成頁：下載 QR Code
                 page.wait_for_url("**/MailShipCompleted**", timeout=30_000)
@@ -235,27 +292,91 @@ class IBoxWorker(threading.Thread):
         finally:
             self.signals.finished.emit()
 
+    # ── Step 1：填寄件人（覆蓋「帶入會員資料」預設值）────────────
+    def _fill_sender(self, page):
+        s = self.sender
+        county, district, road, detail = parse_tw_address(s["addr"])
+        phone = clean_phone(s["phone"])
+
+        try:
+            page.fill("input[placeholder*='寄件人姓名']", s["name"], timeout=3_000)
+        except Exception:
+            pass
+        try:
+            page.fill("input[placeholder*='手機']", phone, timeout=3_000)
+        except Exception:
+            pass
+        if county:
+            try:
+                page.select_option("#MAIL_SADD_CITY", county, timeout=5_000)
+                page.wait_for_timeout(1_000)
+            except Exception:
+                pass
+        if district:
+            try:
+                page.wait_for_function(
+                    "document.querySelector('#MAIL_SADD_AREA').options.length > 1",
+                    timeout=8_000,
+                )
+                page.select_option("#MAIL_SADD_AREA", label=district, timeout=5_000)
+            except Exception:
+                pass
+        if road:
+            try:
+                page.fill("#MAIL_SADD_ROAD", road, timeout=3_000)
+            except Exception:
+                pass
+        if detail:
+            try:
+                page.fill("#MAIL_SADD_OTHER", detail, timeout=3_000)
+            except Exception:
+                pass
+
     # ── 登入 ──────────────────────────────────────────────────
     def _do_login(self, page):
         self.signals.log.emit("填入帳號密碼，等待圖形驗證碼...")
-        # 嘗試填帳號（多種 selector 備援）
-        for sel in ["#loginId", "input[name='loginId']", "input[placeholder*='帳號']",
-                    "input[placeholder*='email']", "input[type='email']"]:
-            try:
-                page.fill(sel, self.credentials["username"], timeout=3_000)
-                break
-            except Exception:
-                pass
-        # 填密碼
         try:
-            page.fill("input[type='password']", self.credentials["password"])
+            page.fill("#inputEmail", self.credentials["username"], timeout=5_000)
+        except Exception:
+            pass
+        try:
+            page.fill("#inputPd", self.credentials["password"], timeout=5_000)
         except Exception:
             pass
 
-        # 通知 UI 顯示驗證碼提示
-        self.signals.captcha_needed.emit()
+        # 截圖驗證碼並嘗試 Claude 自動判讀（最多 3 次）
+        captcha_path = os.path.join(os.path.expanduser("~"), "Downloads", "captcha.png")
+        for attempt in range(1, 4):
+            try:
+                page.wait_for_selector("#imgCode", timeout=5_000)
+                page.locator("#imgCode").screenshot(path=captcha_path)
+                captcha_text = solve_captcha_with_claude(captcha_path)
+                if not captcha_text:
+                    break  # API 無回應，直接退到手動
+                self.signals.log.emit(f"驗證碼自動判讀（第 {attempt} 次）：{captcha_text}")
+                page.fill("#inputCaptcha", captcha_text, timeout=3_000)
+                for btn_sel in ["#btnLogin", "button[type='submit']",
+                                "input[type='submit']", "button:has-text('登入')"]:
+                    try:
+                        page.click(btn_sel, timeout=3_000)
+                        break
+                    except Exception:
+                        pass
+                try:
+                    page.wait_for_url(
+                        lambda url: "Login" not in url and "login" not in url,
+                        timeout=15_000,
+                    )
+                    self.signals.login_done.emit()
+                    return  # 自動登入成功
+                except Exception:
+                    self.signals.log.emit(f"第 {attempt} 次驗證碼錯誤，重新取得...")
+                    page.wait_for_timeout(1_000)
+            except Exception:
+                break
 
-        # 等使用者完成驗證碼並登入（最多 2 分鐘）
+        # 手動登入：通知 UI 顯示驗證碼提示，等使用者完成（最多 2 分鐘）
+        self.signals.captcha_needed.emit()
         page.wait_for_url(
             lambda url: "Login" not in url and "login" not in url,
             timeout=120_000,
@@ -275,7 +396,8 @@ class IBoxWorker(threading.Thread):
             except Exception:
                 pass
         try:
-            page.click("button:has-text('下一步')", timeout=5_000)
+            page.wait_for_selector("#btn-green", timeout=5_000)
+            page.click("#btn-green")
             page.wait_for_load_state("networkidle")
         except Exception:
             pass
@@ -284,19 +406,14 @@ class IBoxWorker(threading.Thread):
     def _agree_terms(self, page):
         self.signals.log.emit("處理注意事項頁面...")
         try:
-            # 先嘗試捲動條款容器，再捲整頁
-            page.evaluate("""
-                const box = document.querySelector(
-                    '.rule-content, .terms-content, [class*="rule"], [class*="terms"]'
-                );
-                if (box) box.scrollTop = box.scrollHeight;
-                window.scrollTo(0, document.body.scrollHeight);
-            """)
+            page.wait_for_selector("#termsContainer", timeout=10_000)
+            page.evaluate("document.querySelector('#termsContainer').scrollTop = document.querySelector('#termsContainer').scrollHeight;")
             page.wait_for_timeout(800)
+            page.wait_for_selector("#submitButton:not([disabled])", timeout=10_000)
+            page.click("#submitButton")
+            page.wait_for_load_state("networkidle")
         except Exception:
             pass
-        page.click("button:has-text('同意並開始建立託運單')")
-        page.wait_for_load_state("networkidle")
 
     # ── Step 2：填收件人 ──────────────────────────────────────
     def _fill_recipient(self, page):
@@ -304,82 +421,58 @@ class IBoxWorker(threading.Thread):
         county, district, road, detail = parse_tw_address(cust["addr"])
         phone = clean_phone(cust["phone"])
 
-        # 姓名
-        for sel in ["input[placeholder*='收件人姓名']", "input[placeholder*='姓名']"]:
-            try:
-                page.fill(sel, cust["display_name"], timeout=3_000)
-                break
-            except Exception:
-                pass
-
-        # 電話（i郵箱收件人需手機號碼）
-        for sel in ["input[placeholder*='手機']", "input[placeholder*='電話']",
-                    "input[placeholder*='行動']"]:
-            try:
-                page.fill(sel, phone, timeout=3_000)
-                break
-            except Exception:
-                pass
-
-        # 地址類型選「一般地址」（value=001）
         try:
-            page.select_option("select", "001", timeout=3_000)
-            page.wait_for_timeout(300)
+            page.fill("input[placeholder*='收件人姓名']", cust["display_name"], timeout=5_000)
         except Exception:
             pass
 
-        # 縣市（連動下拉）
+        try:
+            page.fill("input[placeholder*='手機']", phone, timeout=5_000)
+        except Exception:
+            pass
+
+        try:
+            page.select_option("#MAIL_RADD_TYPE", "001", timeout=5_000)
+        except Exception:
+            pass
+
         if county:
-            for sel in ['select[name="city"]', 'select[id*="city"]']:
-                try:
-                    page.select_option(sel, label=county, timeout=3_000)
-                    page.wait_for_timeout(800)
-                    break
-                except Exception:
-                    pass
+            try:
+                page.select_option("#MAIL_RADD_CITY", county, timeout=5_000)
+                page.wait_for_timeout(1_000)
+            except Exception:
+                pass
 
-        # 鄉鎮市區（等縣市 AJAX 更新後才有選項）
         if district:
-            for sel in ['select[name="district"]', 'select[id*="district"]']:
-                try:
-                    page.wait_for_selector(
-                        f'{sel} option:not([value=""])', timeout=5_000
-                    )
-                    page.select_option(sel, label=district, timeout=3_000)
-                    page.wait_for_timeout(500)
-                    break
-                except Exception:
-                    pass
+            try:
+                page.wait_for_function(
+                    "document.querySelector('#MAIL_RADD_AREA').options.length > 1",
+                    timeout=8_000,
+                )
+                page.select_option("#MAIL_RADD_AREA", label=district, timeout=5_000)
+            except Exception:
+                pass
 
-        # 路街名（鄉道村里欄位）
         if road:
-            for sel in ["input[placeholder*='鄉道村里']", "input[placeholder*='路名']",
-                        "input[placeholder*='路']"]:
-                try:
-                    page.fill(sel, road, timeout=3_000)
-                    break
-                except Exception:
-                    pass
+            try:
+                page.fill("#MAIL_RADD_ROAD", road, timeout=5_000)
+            except Exception:
+                pass
 
-        # 巷弄號碼樓層
         if detail:
-            for sel in ["input[placeholder*='巷弄']", "input[placeholder*='號碼']",
-                        "input[placeholder*='樓層']"]:
-                try:
-                    page.fill(sel, detail, timeout=3_000)
-                    break
-                except Exception:
-                    pass
+            try:
+                page.fill("#MAIL_RADD_OTHER", detail, timeout=5_000)
+            except Exception:
+                pass
 
     # ── Step 3：填包裹 ────────────────────────────────────────
     def _fill_package(self, page):
         pkg = self.package_info
 
-        # 選物品種類（選後會自動彈出尺寸確認彈窗）
+        # 物品種類（#categoryDropdown）
         try:
-            page.select_option("select", {"label": pkg["item_type"]}, timeout=5_000)
+            page.select_option("#categoryDropdown", label=pkg["item_type"], timeout=5_000)
             page.wait_for_timeout(800)
-            # 處理自動彈出的尺寸確認彈窗
             try:
                 page.click("button:has-text('確認')", timeout=3_000)
                 page.wait_for_timeout(500)
@@ -388,23 +481,26 @@ class IBoxWorker(threading.Thread):
         except Exception:
             pass
 
-        # 包材尺寸（預設大，若使用者有改則設定）
+        # 包材尺寸（#sizeDropdown，選項含「大」/「中」/「小」字）
         size_label = IBOX_SIZE_MAP.get(pkg.get("size", "大 (34×24×45cm)"), "大")
         try:
-            # 嘗試找包材 select（通常在物品種類之後）
-            selects = page.locator("select").all()
-            for s in selects:
-                options = s.locator("option").all_inner_texts()
-                if any(size_label in o for o in options):
-                    s.select_option(label=size_label)
-                    page.wait_for_timeout(300)
-                    break
+            opts = page.locator("#sizeDropdown option").all_inner_texts()
+            match = next((o for o in opts if size_label in o), None)
+            if match:
+                page.select_option("#sizeDropdown", label=match)
+                page.wait_for_timeout(300)
+                try:
+                    page.wait_for_selector(".confirm-btn-alert", timeout=5_000)
+                    page.click(".confirm-btn-alert")
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # 簡述內裝物品
+        # 內裝物品描述
         for sel in ["input[placeholder*='內裝物品']", "input[placeholder*='物品']",
-                    "input[placeholder*='品名']", "input[placeholder*='描述']"]:
+                    "input[placeholder*='品名']", "textarea[placeholder*='物品']"]:
             try:
                 page.fill(sel, pkg["description"], timeout=3_000)
                 break
@@ -525,9 +621,9 @@ class IBoxPackageDialog(QDialog):
 
         self.item_type_combo = QComboBox()
         self.item_type_combo.addItems(IBOX_ITEM_TYPES)
-        self.item_type_combo.setCurrentText("禮品")  # 常用預設
+        self.item_type_combo.setCurrentText("零件")
 
-        self.description_input = QLineEdit()
+        self.description_input = QLineEdit("零件")
         self.description_input.setPlaceholderText("例：保養品 ×2、面膜 ×5")
 
         self.size_combo = QComboBox()
@@ -995,6 +1091,7 @@ class CRMDesktopApp(QMainWindow):
         # ⑤ 啟動背景執行緒
         worker = IBoxWorker(
             credentials=credentials,
+            sender=pair["sender"],
             customer=pair["customer"],
             package_info=package_info,
             signals=signals,
