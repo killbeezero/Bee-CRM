@@ -1,9 +1,25 @@
-*.json
-token.json
+# 敏感憑證（絕對不可上傳）
 credentials.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
 venv/
+.venv/
+
+# PyInstaller 產物
 build/
 dist/
-__pycache__/
-*.spec
+*.spec.bak
+
+# macOS
 .DS_Store
+.AppleDouble
+
+# IDE / Claude
+.claude/
+
+# 備份
+*.bak
