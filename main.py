@@ -762,7 +762,7 @@ class IBoxResultDialog(QDialog):
 class CRMDesktopApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("蜜蜂CRM寄件系統")
+        self.setWindowTitle("蜜蜂CRM寄件系統 v1.3")
         self.resize(1100, 850)
         self.pending_list_data   = []
         self._progress_dialog    = None
