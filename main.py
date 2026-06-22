@@ -772,10 +772,15 @@ class CRMDesktopApp(QMainWindow):
         self.main_widget.setLayout(main_layout)
         self.setCentralWidget(self.main_widget)
 
-        # 狀態列 + 帳密設定按鈕（右側小按鈕）
+        # 狀態列 + 重新整理 + 帳密設定按鈕（右側小按鈕）
         top_row = QHBoxLayout()
         self.status_label = QLabel("正在連線雲端...")
         top_row.addWidget(self.status_label, 1)
+        self.reload_btn = QPushButton("🔄 重新整理")
+        self.reload_btn.setFixedWidth(110)
+        self.reload_btn.setStyleSheet("padding: 4px; font-size: 12px;")
+        self.reload_btn.clicked.connect(self.load_all_data)
+        top_row.addWidget(self.reload_btn)
         self.cred_btn = QPushButton("⚙️ i郵箱帳密設定")
         self.cred_btn.setFixedWidth(140)
         self.cred_btn.setStyleSheet("padding: 4px; font-size: 12px;")
@@ -860,6 +865,8 @@ class CRMDesktopApp(QMainWindow):
 
     # ── 載入 Google Sheets 資料 ───────────────────────────────
     def load_all_data(self):
+        self.reload_btn.setEnabled(False)
+        self.status_label.setText("同步中...")
         creds = None
         cred_file  = resource_path("credentials.json")
         token_file = os.path.join(os.path.expanduser("~"), ".蜜蜂CRM_token.json")
@@ -891,6 +898,8 @@ class CRMDesktopApp(QMainWindow):
             self.set_table_style(self.sender_table)
         except Exception as e:
             self.status_label.setText(f"連線失敗：{e}")
+        finally:
+            self.reload_btn.setEnabled(True)
 
     def fill_table(self, table, data, cols):
         table.setRowCount(len(data))
